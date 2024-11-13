@@ -1,0 +1,223 @@
+#!/bin/bash
+
+# ANSI color codes
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 [-u] [-i] <ip_range> [port1] [port2] [port3] ..."
+    echo "  -u, --udp     Use UDP instead of TCP (default is TCP)"
+    echo "                Requires 'nc' (netcat) for UDP scanning"
+    echo "  -i, --info    Include MAC address information (requires arp command)"
+    exit 1
+}
+
+# Check if arp is installed
+check_arp() {
+    if ! command -v arp &> /dev/null; then
+        echo -e "${YELLOW}Warning: 'arp' command not found. To install it:${NC}"
+        echo "  For Debian/Ubuntu: sudo apt-get install net-tools"
+        echo "  For CentOS/RHEL: sudo yum install net-tools"
+        echo "  For macOS: arp should be pre-installed"
+        echo
+        return 1
+    fi
+    return 0
+}
+
+# Check if nc is installed
+check_nc() {
+    if ! command -v nc &> /dev/null; then
+        echo -e "${YELLOW}Warning: 'nc' command not found. To install it:${NC}"
+        echo "  For Debian/Ubuntu: sudo apt-get install netcat"
+        echo "  For CentOS/RHEL: sudo yum install nc"
+        echo "  For macOS: brew install netcat"
+        echo
+        return 1
+    fi
+    return 0
+}
+
+# Function to validate IP range
+validate_ip_range() {
+    if [[ ! $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        echo -e "${RED}Error: Invalid IP range format. Use format like 192.168.1.0/24${NC}"
+        exit 1
+    fi
+    
+    IFS='/' read -r ip subnet <<< "$1"
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    
+    if [[ $o1 -gt 255 || $o2 -gt 255 || $o3 -gt 255 || $o4 -gt 255 || $subnet -gt 32 ]]; then
+        echo -e "${RED}Error: Invalid IP address or subnet${NC}"
+        exit 1
+    fi
+}
+
+# Function to validate port
+validate_port() {
+    if ! [[ $1 =~ ^[0-9]+$ ]] || [ $1 -lt 1 ] || [ $1 -gt 65535 ]; then
+        echo -e "${RED}Error: Invalid port number '$1'. Ports must be between 1 and 65535.${NC}"
+        exit 1
+    fi
+}
+
+# Initialize variables
+protocol="tcp"
+use_arp=false
+
+# Parse options
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -u|--udp)
+            protocol="udp"
+            if check_nc; then
+                :
+            else
+                echo -e "${RED}Error: Cannot use -u option: nc command not available.${NC}"
+                exit 1
+            fi
+            shift ;;
+        -i|--info) 
+            if check_arp; then
+                use_arp=true
+            else
+                echo -e "${RED}Error: Cannot use -i option: arp command not available.${NC}"
+                exit 1
+            fi
+            shift ;;
+        -*) echo -e "${RED}Error: Unknown option $1${NC}"; usage ;;
+        *) break ;;
+    esac
+done
+
+# Check if at least 1 argument is provided after options
+if [ $# -lt 1 ]; then
+    echo -e "${RED}Error: IP range not provided${NC}"
+    usage
+fi
+
+# Validate IP range
+validate_ip_range $1
+ip_range=$1
+shift
+
+# Validate ports if provided
+for port in "$@"; do
+    validate_port $port
+done
+
+# Extract IP and subnet
+ip=$(echo $ip_range | cut -d'/' -f1)
+subnet=$(echo $ip_range | cut -d'/' -f2)
+
+# Calculate the base IP
+IFS='.' read -r i1 i2 i3 i4 <<< "$ip"
+base_ip="$i1.$i2.$i3"
+
+# Function to get MAC address
+get_mac() {
+    local ip=$1
+    if $use_arp; then
+        # Get first MAC address, clean up format, and validate
+        local mac=$(arp -a $ip 2>/dev/null | 
+                   grep -o -E '([[:xdigit:]]{1,2}:){5}[[:xdigit:]]{1,2}' | 
+                   head -n 1 |
+                   tr '[:lower:]' '[:upper:]' |
+                   grep -E '^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
+        
+        # Only return MAC if it's valid
+        if [[ -n "$mac" && "$mac" != "00:00:00:00:00:00" ]]; then
+            echo "$mac"
+        else
+            echo ""
+        fi
+    else
+        echo ""
+    fi
+}
+
+# Function to discover active hosts
+discover_host() {
+    local ip=$1
+    if ping -c 1 -W 1 $ip >/dev/null 2>&1; then
+        local mac=$(get_mac $ip)
+        if [ -n "$mac" ]; then
+            echo -e "${GREEN}$ip${NC} is active (MAC: ${YELLOW}$mac${NC})"
+        else
+            echo -e "${GREEN}$ip${NC} is active"
+        fi
+    fi
+}
+
+# Function to scan a specific IP and port
+scan_port() {
+    local ip=$1
+    local port=$2
+    local mac=$(get_mac $ip)
+    local result=""
+    if [ "$protocol" = "tcp" ]; then
+        if (timeout 1 bash -c "</dev/$protocol/$ip/$port" 2>/dev/null); then
+            result="${GREEN}$ip${NC} Port $port is open"
+        fi
+    else
+        # Use nc for UDP scanning
+        output=$(nc -vz -u -w 1 "$ip" "$port" 2>&1)
+        if echo "$output" | grep -q "Connection refused"; then
+            # Port is closed
+            return
+        elif ! ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+            # Host is not responding
+            return
+        elif echo "$output" | grep -q "open"; then
+            result="${GREEN}$ip${NC} Port $port is open (UDP)"
+        fi
+    fi
+    if [ -n "$result" ]; then
+        if [ -n "$mac" ]; then
+            echo -e "$result (MAC: ${YELLOW}$mac${NC})"
+        else
+            echo -e "$result"
+        fi
+    fi
+}
+
+# Print the command being executed
+echo -n "Executing: $0 "
+$use_arp && echo -n "-i "
+[ "$protocol" = "udp" ] && echo -n "-u "
+echo "$ip_range $@"
+
+# Check if ports are specified
+if [ $# -eq 0 ]; then
+    echo "No ports specified. Discovering active hosts..."
+    discover_mode=true
+else
+    echo "Scanning for open $protocol ports..."
+    discover_mode=false
+fi
+echo
+
+# Loop through the IP range
+for i in $(seq 0 $((2**(32-$subnet) - 1))); do
+    current_ip="$base_ip.$i"
+    if $discover_mode; then
+        discover_host $current_ip &
+    else
+        for port in "$@"; do
+            scan_port $current_ip $port &
+        done
+    fi
+done
+
+wait
+echo
+
+if $discover_mode; then
+    echo "Host discovery complete."
+else
+    echo "Port scan complete."
+fi
